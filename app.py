@@ -15,8 +15,16 @@ cors = CORS(app)
 app.config['CORS_HEADERS'] = 'Content-Type'
 PORT = os.environ.get('PORT')
 
-# initialize redis cache
-cache = redis.Redis(host='localhost', port=6379, db=0)
+# Redis Config
+REDIS_HOST = os.environ.get('REDIS_HOST')
+REDIS_PASS = os.environ.get('REDIS_PASS')
+REDIS_PORT = os.environ.get('REDIS_PORT')
+
+# Initialize redis cache
+cache = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASS, db=0)
+
+# cache.json().set('trie','$', {'*':'', 'end': False})
+# cache.execute_command('JSON.SET', 'trie', '.', {'*':'', 'end': False})
 
 # Initialize Firestore DB
 cred = credentials.Certificate('key.json')
@@ -24,21 +32,13 @@ default_app = initialize_app(cred)
 db = firestore.client()
 todo_ref = db.collection('templates')
 
-# Always contains '*' the cuurent string and 'end' if its an end of word, 
+# Always contains '*' the curent string and 'end' if its an end of word, 
 # else everything else are link letters
 
-# toAdd = {'*': 'a', 'end' : False}
-# cache.json().set('trie','$', toAdd)
-print(cache.json().get('trie'))
-# cache.json().get('trie')["next"].append({'word': 'a', 'end' : False, 'next': [None] * 26})
-# print(cache.json().get('trie')['next'])
+# Get Trie view
+# print(cache.json().get('trie'))
 
-# cache.execute_command('JSON.SET', 'trie', '.', json.dumps(toAdd))
-# cache.execute_command('JSON.SET', 'trie', '.a', json.dumps(toAdd))
-# reply = json.loads(cache.execute_command('JSON.GET', 'trie', '.a.b'))
-# print(reply)
-
-# helper function to traverse trie and get up to 5 possible autocomplete
+# Helper function to traverse trie and get up to 5 possible autocomplete
 def getSuggestions(search):
     suggestions = []
     queue = collections.deque()
@@ -47,7 +47,7 @@ def getSuggestions(search):
     while queue and len(suggestions) < 5:
         cur = queue.popleft()
         if cur['end']:
-            suggestions.append({'name': cur['*']})
+            suggestions.append({'value': cur['*']})
         del cur['*']
         del cur['end']
         for item in cur.values():
@@ -56,11 +56,13 @@ def getSuggestions(search):
     return suggestions
 
 
+# Health check endpoint
 @app.route('/api/v1/health', methods=['GET'])
 @cross_origin()
 def health():
     return {'message':'OK'}
 
+# Search feature, queries trie for prefix and returns possible ends
 @app.route('/api/v1/query', methods=['GET'])
 @cross_origin()
 def query():
@@ -77,18 +79,35 @@ def query():
         # get json/trie
         try:
             if path == "":
-                curRedis = json.loads(cache.execute_command('JSON.GET', 'trie'))
+                curRedis = cache.execute_command('JSON.GET', 'trie')
             else:
-                curRedis = json.loads(cache.execute_command('JSON.GET', 'trie', path))
+                curRedis = cache.execute_command('JSON.GET', 'trie', path)
+            # print(curRedis)
             suggestions = getSuggestions(curRedis)
         except:
             print('except')
             pass
-
+        # print(suggestions)
         return {'suggestions': suggestions}
     
     return {"message":"No input given"}
 
+# Gets template from firebase db
+@app.route('/api/v1/retrievetemplate', methods=['GET'])
+@cross_origin()
+def getTemplate():
+    try:
+        # Check if ID was passed to URL query
+        diagnosis_id = request.args.get('diagnosis')
+        if diagnosis_id:
+            template = todo_ref.document(diagnosis_id).get()
+            return jsonify(template.to_dict()), 200
+        else:
+            return {"message": "No diagnosis passed."}
+    except Exception as e:
+        return f"An Error Occurred: {e}"
+
+# Adds diagnosis to trie and then persists in firebase db
 @app.route('/api/v1/create', methods=['POST', 'OPTIONS'])
 @cross_origin()
 def create():
@@ -96,33 +115,26 @@ def create():
         print('OPTIONS')
     # add to redis trie
     diagnosis = request.get_json()['diagnosis'].lower()
+    diagnosis = ''.join(filter(str.isalnum, diagnosis))
 
     path = ""
     for index, letter in enumerate(diagnosis):
         path = path + "." + letter
         try:
             reply = cache.execute_command('JSON.GET', 'trie', path)
-            print(reply)
+            # print(reply)
         except redis.exceptions.ResponseError as e:
             # print(e)
             toAdd = {'*': diagnosis[:index+1], 'end' : (index==len(diagnosis)-1)}
             cache.execute_command('JSON.SET', 'trie', path, json.dumps(toAdd))
-        print(cache.json().get('trie'))
-            
+        # print(cache.json().get('trie'))
 
-    # toAdd = {'*': diagnosis, 'end' : True}
-    # cache.execute_command('JSON.SET', 'trie', path, json.dumps(toAdd))
-    
     # add to firebase
     try:
-        id = request.get_json()['diagnosis']
-        todo_ref.document(id).set(request.json)
+        todo_ref.document(diagnosis).set(request.json)
         return jsonify({"completed": True}), 200
     except Exception as e:
         return f"An Error Occurred: {e}"
-    #print(request.get_json()['diagnosis'])
-
-    return {'status':'OK', 'completed': True}
 
 
 if __name__ == "__main__":
